@@ -232,15 +232,19 @@ def handle_timeout(user_id):
 @bot.message_handler(func=lambda message: message.chat.id in user_quiz)
 def check_answer(message):
     user_id = message.chat.id
-    user_response = message.text.strip()
-    correct_answer = user_quiz[user_id][user_quiz[user_id]["type"]]
+    user_response = message.text.strip().lower()
     
-    if user_response.lower() == correct_answer.lower():
-        bot.send_message(user_id, "✅ Correct! 🎉 Type /quiz for another one!")
+    quiz_data = user_quiz[user_id]
+    correct_answers = quiz_data[quiz_data["type"]].lower().split(",")  # Split meanings by comma
+    correct_answers = [ans.strip() for ans in correct_answers]  # Remove spaces
+
+    if user_response in correct_answers:
+        bot.send_message(user_id, f"✅ Correct! 🎉\n\nAll possible meanings: *{', '.join(correct_answers)}*", parse_mode="Markdown")
     else:
-        bot.send_message(user_id, f"❌ Wrong! The correct answer was: *{correct_answer}*.", parse_mode="Markdown")
-    
-    del user_quiz[user_id]
+        bot.send_message(user_id, f"❌ Wrong! The correct answers were: *{', '.join(correct_answers)}*", parse_mode="Markdown")
+
+    del user_quiz[user_id]  # Remove current quiz session
+
 
 
 # Function to show mode selection buttons
