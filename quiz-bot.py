@@ -1,15 +1,20 @@
+# -*- coding: utf-8 -*-
 import os
 import random
 import gspread
 import telebot
 import threading
 import time
+import json
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # Telegram Bot Token (Replace with your actual token)
 TELEGRAM_BOT_TOKEN = "TOKEN"
+SETTINGS_FILE = "user_settings.json"
+
+
 
 # Dictionaries for user-specific settings
 user_sheets = {}
@@ -20,6 +25,8 @@ user_timeouts = {}
 user_states = {}  # Stores what command the user is entering
 user_quiz = {}  # Tracks active quizzes
 
+
+
 # Setup Google Sheets API
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
@@ -27,6 +34,57 @@ client = gspread.authorize(creds)
 
 # Telegram Bot Setup
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+
+def save_user_settings():
+    settings = {
+        "preferences": user_preferences,
+        "intervals": user_intervals,
+        "timeouts": user_timeouts,
+        "quiet_intervals": {
+            k: (v[0].strftime("%H:%M"), v[1].strftime("%H:%M")) for k, v in user_quiet_intervals.items()
+        }
+    }
+    
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4)
+
+    print("User settings saved.")  # Removed emoji to prevent encoding error
+
+
+
+def load_user_settings():
+    global user_preferences, user_intervals, user_timeouts, user_quiet_intervals, user_sheets
+    
+    if not os.path.exists(SETTINGS_FILE) or os.stat(SETTINGS_FILE).st_size == 0:
+        print("WARNING: No settings file found or file is empty. Creating a new one.")
+        save_user_settings()  # Ensure a default settings file is created
+        return  # Exit function to avoid loading errors
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+
+        user_preferences = settings.get("preferences", {})
+        user_intervals = settings.get("intervals", {})
+        user_timeouts = settings.get("timeouts", {})
+        user_quiet_intervals = {
+            int(k): (datetime.strptime(v[0], "%H:%M").time(), datetime.strptime(v[1], "%H:%M").time())
+            for k, v in settings.get("quiet_intervals", {}).items()
+        }
+        user_sheets = {}  # Google Sheets cannot be stored
+
+        print("User settings loaded successfully.")
+
+    except (json.JSONDecodeError, ValueError):
+        print("WARNING: Settings file is corrupted. Resetting settings.")
+        save_user_settings()  # Reset settings
+
+
+
+load_user_settings()
+
+    
 
 # Interactive Keyboard for Commands
 def get_commands_keyboard():
@@ -111,7 +169,8 @@ def handle_user_input(message):
         if message.text.isdigit():
             interval = int(message.text)
             user_intervals[user_id] = interval
-            bot.send_message(user_id, f"✅ Quiz interval set to *{interval} minutes*. Use /startquiz to begin automatic quizzes.")
+            save_user_settings()  # Save after change
+            bot.send_message(user_id, f"✅ Quiz interval set to *{interval} minutes*.")
         else:
             bot.send_message(user_id, "⚠️ Please enter a valid number.")
 
@@ -129,18 +188,15 @@ def handle_user_input(message):
             if len(quiet_times) != 2:
                 raise ValueError("Invalid format")
 
-            # Convert input times to datetime.time
             quiet_start = datetime.strptime(quiet_times[0], "%H:%M").time()
             quiet_end = datetime.strptime(quiet_times[1], "%H:%M").time()
             
-            # Store in dictionary
             user_quiet_intervals[user_id] = (quiet_start, quiet_end)
+            save_user_settings()  # Save after change
 
             bot.send_message(user_id, f"🌙 Quiet hours set from {quiet_start.strftime('%H:%M')} to {quiet_end.strftime('%H:%M')}.")
         except ValueError:
             bot.send_message(user_id, "⚠️ Invalid format. Use HH:MM-HH:MM (e.g., `22:00-07:00`).")
-        
-
 
 
 @bot.message_handler(commands=["startquiz"])
@@ -262,11 +318,12 @@ def show_mode_selection(user_id):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def handle_mode_selection(call):
-    print(f"DEBUG: Mode selection triggered with {call.data}")  # Debugging line
     user_id = call.message.chat.id
     mode = call.data.replace("mode_", "")
     user_preferences[user_id] = mode
+    save_user_settings()  # Save after change
     bot.send_message(user_id, f"✅ Quiz mode set to *{mode}*.", parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
 
 
 @bot.message_handler(commands=["quiz"])
