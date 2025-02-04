@@ -30,7 +30,7 @@ user_timeouts = {}
 user_states = {}         # Текущее состояние (какую команду вводит пользователь)
 user_quiz = {}           # Текущие активные викторины
 user_timeouts_active = {}  # Флаг активного отсчёта таймаута
-user_quiz_active = {}      # Флаг включения автоматической отправки викизов
+user_quiz_active = {}      # Флаг включения автоматической отправки викторин
 
 # Для предотвращения дублирования отправки квизов при коротких интервалах/таймаутах
 last_quiz_sent = {}      # { user_id: timestamp_last_quiz }
@@ -160,7 +160,7 @@ def handle_command_click(call):
         bot.send_message(user_id, "🌙 Enter the quiet interval in `HH:MM-HH:MM` format (e.g., `22:00-07:00`).")
         user_states[user_id] = "setquietinterval"
     elif call.data == "settimeout":
-        bot.send_message(user_id, "⌛ Enter the answer timeout in minutes (0 to 1440, 0 = disabled).")
+        bot.send_message(user_id, "⌛ Enter the answer timeout in minutes (0 to 1440, 0 = no timeout).")
         user_states[user_id] = "settimeout"
     elif call.data == "quiz":
         # Включаем автоматическую отправку квизов и запускаем планировщик
@@ -367,7 +367,6 @@ def send_quiz_auto(user_id):
 
     kanji_entry = random.choice(data)
     question_type = user_preferences.get(user_id, "random")
-
     if question_type == "random":
         question_type = random.choice(["reading", "meaning"])
 
@@ -394,7 +393,6 @@ def send_quiz_auto(user_id):
         if not user_timeouts_active.get(user_id, False):
             user_timeouts_active[user_id] = True
             executor.submit(handle_timeout_check, user_id, timeout_seconds)
-    # Если Answer Timeout = 0, не планируем автоматическую проверку таймаута.
     else:
         logging.info(f"Answer Timeout is 0 for {user_id}: no timeout check scheduled.")
 
@@ -429,7 +427,12 @@ def handle_timeout(user_id):
 
 @bot.message_handler(func=lambda message: message.chat.id in user_quiz)
 def check_answer(message):
-    """Проверяет ответ пользователя на викторину."""
+    """Проверяет ответ пользователя на викторину.
+    
+    При включённом авто квизе следующий вопрос задаётся не сразу,
+    а только после истечения полного времени таймаута.
+    Если Answer Timeout = 0, следующий вопрос задаётся сразу после ответа.
+    """
     user_id = message.chat.id
     user_response = message.text.strip().lower()
 
@@ -447,14 +450,26 @@ def check_answer(message):
             parse_mode="Markdown"
         )
     else:
-        bot.send_message(user_id, f"❌ Incorrect! Correct answer: {', '.join(correct_answers)}.")
+        bot.send_message(user_id, "❌ Incorrect! Try again.")
 
-    # Независимо от правильности ответа, если квиз активен, удаляем его и задаём новый вопрос.
-    if user_id in user_quiz:
-        del user_quiz[user_id]
+    # Удаляем активный квиз и отменяем таймаут
+    del user_quiz[user_id]
     user_timeouts_active[user_id] = False
-    time.sleep(2)
-    send_quiz_auto(user_id)
+
+    # Получаем значение Answer Timeout (в минутах)
+    timeout_value = user_timeouts.get(user_id, 1)
+    if timeout_value == 0:
+        # Если таймаут отключён – задаём следующий вопрос сразу после ответа.
+        time.sleep(2)
+        send_quiz_auto(user_id)
+    else:
+        # Если таймаут включён – вычисляем, сколько осталось до его истечения.
+        elapsed = time.time() - quiz_data["start_time"]
+        timeout_seconds = timeout_value * 60
+        remaining = timeout_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        send_quiz_auto(user_id)
 
 
 @bot.message_handler(commands=["stopquizauto"])
