@@ -35,19 +35,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Словари для настроек пользователей (идентификатор пользователя – int)
 user_sheets = {}
-user_intervals = {}      # интервал викторины (в минутах)
+# user_intervals удалён
 user_preferences = {}
-user_quiet_intervals = {}  # кортеж (quiet_start, quiet_end)
+user_quiet_intervals = {}
 user_timeouts = {}       # таймаут ответа (в минутах)
 user_states = {}         # текущее состояние (какую команду ввёл пользователь)
-user_quiz = {}           # текущие активные викторины
+user_quiz = {}           # текущая активная викторина
 user_timeouts_active = {}  # флаг активного отсчёта таймаута
-user_quiz_active = {}    # флаг включения автоматической отправки викторин
-user_next_quiz_sent = {} # флаг, показывающий, что следующий квиз уже отправлен (после правильного ответа)
-
-# Для предотвращения дублирования отправки викторин при коротких интервалах/таймаутах
-last_quiz_sent = {}      # { user_id: время последней отправки викторины }
-SEND_QUIZ_COOLDOWN = 5   # в секундах
+user_quiz_active = {}    # флаг автоотправки викторин
+user_next_quiz_sent = {} # флаг, показывающий, что следующий квиз уже отправлен
 
 # Настройка API Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -64,12 +60,13 @@ def save_user_settings():
     """Сохранить настройки пользователей в JSON-файл."""
     settings = {
         "preferences": {str(k): v for k, v in user_preferences.items()},
-        "intervals": {str(k): v for k, v in user_intervals.items()},
         "timeouts": {str(k): v for k, v in user_timeouts.items()},
         "quiet_intervals": {
             str(k): (v[0].strftime("%H:%M"), v[1].strftime("%H:%M")) for k, v in user_quiet_intervals.items()
         },
-        "sheets": {str(k): v.spreadsheet.url for k, v in user_sheets.items() if v}
+        "sheets": {str(k): v.spreadsheet.url for k, v in user_sheets.items() if v},
+        "auto_quiz_active": {str(k): user_quiz_active.get(k, True) for k in user_preferences.keys()},
+        "quiz_schedule_status": {str(k): "Active" if user_quiz_active.get(k, True) else "Stopped" for k in user_preferences.keys()}
     }
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=4)
@@ -77,7 +74,7 @@ def save_user_settings():
 
 def load_user_settings():
     """Загрузить настройки пользователей из JSON-файла."""
-    global user_preferences, user_intervals, user_timeouts, user_quiet_intervals, user_sheets
+    global user_preferences, user_timeouts, user_quiet_intervals, user_sheets, user_quiz_active
     if not os.path.exists(SETTINGS_FILE) or os.stat(SETTINGS_FILE).st_size == 0:
         logging.warning("Файл настроек не найден или пуст. Создаю новый файл.")
         save_user_settings()
@@ -86,7 +83,6 @@ def load_user_settings():
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             settings = json.load(f)
         user_preferences = {int(k): v for k, v in settings.get("preferences", {}).items()}
-        user_intervals = {int(k): v for k, v in settings.get("intervals", {}).items()}
         user_timeouts = {int(k): v for k, v in settings.get("timeouts", {}).items()}
         user_quiet_intervals = {
             int(k): (datetime.strptime(v[0], "%H:%M").time(), datetime.strptime(v[1], "%H:%M").time())
@@ -101,6 +97,10 @@ def load_user_settings():
                 logging.error(f"Не удалось переподключиться к Google таблице для пользователя {uid}: {e}")
                 user_sheets_temp[int(uid)] = None
         user_sheets = user_sheets_temp
+        # Загружаем автоотправку викторин (если присутствует)
+        auto_status = settings.get("auto_quiz_active", {})
+        for uid_str, status in auto_status.items():
+            user_quiz_active[int(uid_str)] = status
         logging.info("Настройки пользователя успешно загружены.")
     except (json.JSONDecodeError, ValueError):
         logging.error("Файл настроек повреждён. Сбрасываю настройки.")
@@ -113,7 +113,6 @@ def get_commands_keyboard():
         (loc["btn_setup"], "setup"),
         (loc["btn_quiz"], "quiz"),
         (loc["btn_setmode"], "setmode"),
-        (loc["btn_setinterval"], "setinterval"),
         (loc["btn_setquietinterval"], "setquietinterval"),
         (loc["btn_settimeout"], "settimeout"),
         (loc["btn_settings"], "settings"),
@@ -138,6 +137,11 @@ def send_help(message):
     """Отправка справочного сообщения."""
     bot.send_message(message.chat.id, loc["help_message"], reply_markup=get_commands_keyboard())
 
+# Отладочная команда: вывод UID пользователя
+@bot.message_handler(commands=["uid"])
+def send_uid(message):
+    bot.send_message(message.chat.id, f"Ваш UID: {message.chat.id}")
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_command_click(call):
     """Обработка нажатий кнопок inline-клавиатуры."""
@@ -148,9 +152,6 @@ def handle_command_click(call):
     elif call.data == "setmode":
         show_mode_selection(user_id)
         bot.answer_callback_query(call.id)
-    elif call.data == "setinterval":
-        bot.send_message(user_id, loc["setinterval_prompt"])
-        user_states[user_id] = "setinterval"
     elif call.data == "setquietinterval":
         bot.send_message(user_id, loc["setquietinterval_prompt"])
         user_states[user_id] = "setquietinterval"
@@ -159,10 +160,11 @@ def handle_command_click(call):
         user_states[user_id] = "settimeout"
     elif call.data == "quiz":
         user_quiz_active[user_id] = True
-        start_quiz_schedule(user_id)
+        send_quiz_auto(user_id)
     elif call.data == "stopquiz":
-        if user_id in user_intervals:
-            del user_intervals[user_id]
+        # Останавливаем текущую викторину
+        if user_id in user_quiz:
+            del user_quiz[user_id]
             bot.send_message(user_id, loc["stopquiz_success"])
         else:
             bot.send_message(user_id, loc["stopquiz_not_found"])
@@ -170,7 +172,7 @@ def handle_command_click(call):
         if user_quiz_active.get(user_id, True):
             user_quiz_active[user_id] = False
             bot.send_message(user_id, loc["stopquizauto_success"])
-            logging.info(f"Автоматическая отправка викторин отключена для {user_id}.")
+            logging.info(f"Автоотправка викторин отключена для {user_id}.")
         else:
             bot.send_message(user_id, loc["stopquizauto_already"])
         bot.answer_callback_query(call.id)
@@ -196,8 +198,6 @@ def handle_user_input(message):
     del user_states[user_id]
     if command == "setup":
         handle_setup_command(user_id, message)
-    elif command == "setinterval":
-        handle_set_interval_command(user_id, message)
     elif command == "settimeout":
         handle_set_timeout_command(user_id, message)
     elif command == "setquietinterval":
@@ -215,20 +215,6 @@ def handle_setup_command(user_id, message):
         bot.send_message(user_id, loc["google_sheet_setup_error"])
     except Exception as e:
         bot.send_message(user_id, loc["google_sheet_setup_exception"].format(error=str(e)))
-
-def handle_set_interval_command(user_id, message):
-    """Обработка команды установки интервала викторины."""
-    if message.text.isdigit():
-        interval = int(message.text)
-        if not (1 <= interval <= 60):
-            bot.send_message(user_id, loc["setinterval_invalid"])
-            return
-        user_intervals[user_id] = interval
-        save_user_settings()
-        logging.info(f"Пользователь {user_id} установил интервал викторины: {interval} минут.")
-        bot.send_message(user_id, loc["setinterval_success"].format(interval=interval), parse_mode="Markdown")
-    else:
-        bot.send_message(user_id, loc["setinterval_invalid_input"])
 
 def handle_set_timeout_command(user_id, message):
     """Обработка команды установки таймаута ответа."""
@@ -262,84 +248,26 @@ def handle_set_quiet_interval_command(user_id, message):
     except ValueError:
         bot.send_message(user_id, loc["setquietinterval_invalid"])
 
-def start_quiz_schedule(user_id):
-    """Запуск планировщика викторин для пользователя."""
-    if user_id in user_intervals:
-        bot.send_message(user_id, loc["quiz_start"].format(interval=user_intervals[user_id]))
-        if user_id not in user_quiz:
-            executor.submit(quiz_scheduler, user_id, user_intervals[user_id])
-    else:
-        bot.send_message(user_id, loc["set_interval_first"])
-
 def show_user_settings_inline(user_id):
-    """Показывает текущие настройки пользователя, включая оставшееся время до следующего вопроса."""
-    interval = user_intervals.get(user_id, None)
+    """Показывает текущие настройки пользователя, включая статус автоотправки и статус викторины."""
     mode = user_preferences.get(user_id, "По умолчанию (случайный)")
     timeout = user_timeouts.get(user_id, None)
     quiet = user_quiet_intervals.get(user_id, None)
-    interval_text = f"{interval} минут" if interval is not None else "Не установлено"
-    timeout_text = f"{timeout} минут" if timeout is not None else "По умолчанию (10 мин)"
+    timeout_text = f"{timeout} минут" if timeout is not None else "Не установлено"
     quiet_text = f"{quiet[0].strftime('%H:%M')} - {quiet[1].strftime('%H:%M')}" if quiet else "Не установлено"
     auto_quiz_status = "Включена" if user_quiz_active.get(user_id, True) else "Отключена"
-    quiz_schedule_status = "Активно" if interval is not None else "Не активно"
-
-    # Вычисляем оставшееся время до следующего вопроса (если возможно)
-    if user_id in user_intervals and user_id in last_quiz_sent:
-        next_quiz_time = last_quiz_sent[user_id] + user_intervals[user_id] * 60
-        remaining_seconds = int(next_quiz_time - time.time())
-        if remaining_seconds < 0:
-            remaining_time_str = "0 сек"
-        else:
-            minutes, seconds = divmod(remaining_seconds, 60)
-            remaining_time_str = f"{minutes} мин {seconds} сек"
-    else:
-        remaining_time_str = "Не активно"
-
+    quiz_schedule_status = "Активна" if user_quiz.get(user_id) else "Не активна"
     settings_text = loc["settings_message"].format(
         mode=mode,
-        interval=interval_text,
         timeout=timeout_text,
         quiet=quiet_text,
         auto_quiz=auto_quiz_status,
         schedule=quiz_schedule_status
     )
-    # Добавляем информацию о времени до следующего вопроса
-    settings_text += f"\n⏱️ Оставшееся время до следующего вопроса: *{remaining_time_str}*"
     bot.send_message(user_id, settings_text, parse_mode="Markdown")
 
-def quiz_scheduler(user_id, interval):
-    """Планировщик викторин для пользователя с заданным интервалом."""
-    logging.info(f"Планировщик викторин запущен для {user_id} с интервалом {interval} минут.")
-    while user_id in user_intervals:
-        now = datetime.now().time()
-        quiet_interval = user_quiet_intervals.get(user_id)
-        if quiet_interval:
-            quiet_start, quiet_end = quiet_interval
-            if quiet_start <= quiet_end:
-                if quiet_start <= now <= quiet_end:
-                    logging.info(f"{user_id}: Тихий режим активен. Жду 60 секунд.")
-                    time.sleep(60)
-                    continue
-            else:
-                if now >= quiet_start or now <= quiet_end:
-                    logging.info(f"{user_id}: Тихий режим активен. Жду 60 секунд.")
-                    time.sleep(60)
-                    continue
-        send_quiz_auto(user_id)
-        time.sleep(interval * 60)
-    logging.info(f"Планировщик викторин остановлен для {user_id}.")
-
 def send_quiz_auto(user_id):
-    """Отправка викторины пользователю, если она включена."""
-    if not user_quiz_active.get(user_id, True):
-        logging.info(f"Автоматическая отправка викторин отключена для {user_id}.")
-        return
-    if user_id in user_quiz:
-        logging.info(loc["quiz_already_active"].format(user=user_id))
-        return
-    if user_id in last_quiz_sent and (time.time() - last_quiz_sent[user_id]) < SEND_QUIZ_COOLDOWN:
-        logging.info(loc["quiz_recently_sent"].format(user=user_id))
-        return
+    """Отправка викторины пользователю (автоотправка по команде /quiz)."""
     if user_id not in user_sheets:
         bot.send_message(user_id, loc["sheet_not_set"])
         return
@@ -348,10 +276,13 @@ def send_quiz_auto(user_id):
     if not data:
         bot.send_message(user_id, loc["sheet_empty"])
         return
+    # Выбираем случайную запись
     kanji_entry = random.choice(data)
+    # Определяем тип вопроса в зависимости от выбранного режима
     question_type = user_preferences.get(user_id, "random")
     if question_type == "random":
-        question_type = random.choice(["reading", "meaning"])
+        question_type = random.choice(["reading", "meaning", "reverse_reading", "reverse_meaning"])
+    # Сохраняем данные викторины
     user_quiz[user_id] = {
         "kanji": kanji_entry["Kanji"],
         "reading": kanji_entry["Reading"],
@@ -361,10 +292,14 @@ def send_quiz_auto(user_id):
     }
     if question_type == "reading":
         bot.send_message(user_id, loc["reading_question"].format(kanji=kanji_entry["Kanji"]))
-    else:
+    elif question_type == "meaning":
         bot.send_message(user_id, loc["meaning_question"].format(kanji=kanji_entry["Kanji"]))
-    last_quiz_sent[user_id] = time.time()
+    elif question_type == "reverse_reading":
+        bot.send_message(user_id, loc["reverse_reading_question"].format(reading=kanji_entry["Reading"]))
+    elif question_type == "reverse_meaning":
+        bot.send_message(user_id, loc["reverse_meaning_question"].format(meaning=kanji_entry["Meaning"]))
     logging.info(loc["quiz_sent"].format(user=user_id, kanji=kanji_entry["Kanji"], type=question_type))
+    # Если установлен таймаут (> 0), запускаем проверку
     timeout_value = user_timeouts.get(user_id, 1)
     if timeout_value > 0:
         timeout_seconds = timeout_value * 60
@@ -375,7 +310,7 @@ def send_quiz_auto(user_id):
         logging.info(f"Таймаут ответа равен 0 для {user_id}: проверка таймаута не запущена.")
 
 def handle_timeout_check(user_id, timeout):
-    """Проверяет, ответил ли пользователь до истечения времени."""
+    """Проверяет, ответил ли пользователь до истечения времени таймаута."""
     for _ in range(timeout):
         time.sleep(1)
         if user_id not in user_quiz:
@@ -386,9 +321,11 @@ def handle_timeout_check(user_id, timeout):
         handle_timeout(user_id)
 
 def handle_timeout(user_id):
-    """Обработка ситуации, когда время ответа истекло."""
+    """Обработка ситуации истечения времени ответа."""
     if user_id in user_quiz:
-        correct_answer = user_quiz[user_id][user_quiz[user_id]["type"]]
+        correct_answer = (user_quiz[user_id]["kanji"]
+                          if user_quiz[user_id]["type"] in ["reverse_reading", "reverse_meaning"]
+                          else user_quiz[user_id][user_quiz[user_id]["type"]])
         bot.send_message(
             user_id, 
             loc["timeout_message"].format(answer=correct_answer),
@@ -402,7 +339,7 @@ def handle_timeout(user_id):
 def wait_and_send_next(user_id, delay):
     """
     Ожидает заданное время (delay) после правильного ответа и, если пользователь не нажал кнопку «Следующий»,
-    отправляет следующий квиз.
+    отправляет следующий вопрос.
     """
     time.sleep(delay)
     if not user_next_quiz_sent.get(user_id, False):
@@ -413,9 +350,8 @@ def wait_and_send_next(user_id, delay):
 def check_answer(message):
     """
     Проверяет ответ пользователя на викторину.
-    Если ответ неверный, пользователь может повторять попытки до истечения таймаута.
-    При правильном ответе отправляется сообщение с кнопкой «Следующий» — для перехода к следующему вопросу.
-    Если кнопку не нажали, следующий вопрос будет задан автоматически через рассчитанную задержку.
+    Если ответ неверный, выводит оставшееся время до истечения таймаута.
+    При правильном ответе отправляет сообщение с кнопкой «Следующий».
     """
     user_id = message.chat.id
     user_response = message.text.strip().lower()
@@ -423,7 +359,11 @@ def check_answer(message):
         bot.send_message(user_id, loc["no_active_quiz"])
         return
     quiz_data = user_quiz[user_id]
-    correct_answers = [ans.strip() for ans in quiz_data[quiz_data["type"]].lower().split(",")]
+    # Определяем правильный ответ в зависимости от типа викторины
+    if quiz_data["type"] in ["reverse_reading", "reverse_meaning"]:
+        correct_answers = [quiz_data["kanji"].lower()]
+    else:
+        correct_answers = [ans.strip() for ans in quiz_data[quiz_data["type"]].lower().split(",")]
     if user_response in correct_answers:
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton(loc["btn_next"], callback_data="next_question"))
@@ -437,36 +377,44 @@ def check_answer(message):
         user_timeouts_active[user_id] = False
         user_next_quiz_sent[user_id] = False
         timeout_value = user_timeouts.get(user_id, 1)
-        if timeout_value == 0:
-            delay = 2
-        else:
-            elapsed = time.time() - quiz_data["start_time"]
-            timeout_seconds = timeout_value * 60
-            delay = timeout_seconds - elapsed
-            if delay < 0:
-                delay = 0
+        timeout_seconds = timeout_value * 60
+        elapsed = time.time() - quiz_data["start_time"]
+        delay = timeout_seconds - elapsed
+        if delay < 0:
+            delay = 0
         executor.submit(wait_and_send_next, user_id, delay)
     else:
-        bot.send_message(user_id, loc["incorrect_answer_message"])
+        # Вычисляем оставшееся время таймаута
+        timeout_value = user_timeouts.get(user_id, 1)
+        timeout_seconds = timeout_value * 60
+        elapsed = time.time() - quiz_data["start_time"]
+        remaining = int(timeout_seconds - elapsed)
+        if remaining < 0:
+            remaining = 0
+        minutes, seconds = divmod(remaining, 60)
+        remaining_str = f"{minutes} мин {seconds} сек"
+        bot.send_message(user_id, loc["incorrect_answer_message"].format(remaining=remaining_str))
 
 @bot.message_handler(commands=["stopquizauto"])
 def stop_quiz_auto(message):
-    """Останавливает автоматическую отправку викторин для пользователя."""
+    """Останавливает автоотправку викторин для пользователя."""
     user_id = message.chat.id
     if user_quiz_active.get(user_id, True):
         user_quiz_active[user_id] = False
         bot.send_message(user_id, loc["stopquizauto_success"])
-        logging.info(f"Автоматическая отправка викторин отключена для {user_id}.")
+        logging.info(f"Автоотправка викторин отключена для {user_id}.")
     else:
         bot.send_message(user_id, loc["stopquizauto_already"])
 
 def show_mode_selection(user_id):
-    """Показывает кнопки для выбора режима викторины."""
+    """Показывает кнопки для выбора режима викторины, включая реверс-режимы."""
     keyboard = InlineKeyboardMarkup(row_width=3)
     modes = [
         (loc["mode_reading"], "mode_reading"),
         (loc["mode_meaning"], "mode_meaning"),
-        (loc["mode_random"], "mode_random")
+        (loc["mode_random"], "mode_random"),
+        (loc["mode_reverse_reading"], "mode_reverse_reading"),
+        (loc["mode_reverse_meaning"], "mode_reverse_meaning")
     ]
     buttons = [InlineKeyboardButton(text, callback_data=callback_data) for text, callback_data in modes]
     keyboard.add(*buttons)
